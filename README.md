@@ -55,6 +55,8 @@ EOF
 turso dev --db-file wallets01.db
 ```
 
+Migrations run automatically on startup via Diesel.
+
 ## Usage
 
 ### Running the Pipeline
@@ -91,6 +93,7 @@ pm2 logs tracker
 | `cargo check` | Check for compilation errors |
 | `cargo clippy` | Run linter |
 | `cargo fmt` | Format code |
+| `cargo test` | Run tests |
 
 ### Kill Switches
 
@@ -121,6 +124,8 @@ Rate limiting is handled using `tokio::time` or the [`governor`](https://crates.
 
 ## Database Schema
 
+Managed by Diesel migrations. Schema is defined in `migrations/2024-01-01-000000_initial_schema/up.sql`.
+
 ### `accounts`
 
 Stores wallet addresses and their metadata.
@@ -133,19 +138,23 @@ Stores wallet addresses and their metadata.
 | `is_exchange` | INTEGER (0/1) | Exchange flag from TronScan |
 | `is_contract` | INTEGER (0/1) | Contract flag from TronScan |
 | `is_tracked` | INTEGER/NULL | 1 if TronScan tracking completed |
-| `is_tracked_arkm` | INTEGER/NULL | 1 if Arkham enrichment completed |
-| `is_receiver` | INTEGER (0/1) | 1 if wallet received funds |
 | `transferIn` | INTEGER | Inbound transfer count |
 | `transferOut` | INTEGER | Outbound transfer count |
 | `transactionsTron` | INTEGER | Total TRON transaction count |
 | `balanceTron` | INTEGER | TRON balance |
 | `deep` | INTEGER | Depth level |
-| `payload_tronscan` | TEXT/JSON | Full TronScan API response |
-| `arkham_label` | TEXT | Label from Arkham |
-| `populated_tags` | TEXT/JSON | Arkham tags array |
+| `payload_tronscan` | TEXT | Full TronScan API response (JSON) |
 | `is_exchange_arkm` | INTEGER (0/1) | Exchange flag from Arkham |
 | `is_contract_arkm` | INTEGER (0/1) | Contract flag from Arkham |
-| `payload_arkm` | TEXT/JSON | Full Arkham API response |
+| `is_tracked_arkm` | INTEGER/NULL | 1 if Arkham enrichment completed |
+| `payload_arkm` | TEXT | Full Arkham API response (JSON) |
+| `arkham_label` | TEXT | Label from Arkham |
+| `populated_tags` | TEXT | Arkham tags array (JSON) |
+| `mandatory_scan` | INTEGER | Mandatory scan flag |
+| `observations` | TEXT | Notes/observations |
+| `is_receiver` | INTEGER (0/1) | 1 if wallet received funds |
+| `created_at` | INTEGER | Creation timestamp (epoch seconds) |
+| `updated_at` | INTEGER | Last update timestamp (epoch seconds, auto-updated via trigger) |
 | `is_amount_collected` | INTEGER (0/1) | Whether USD amount was fetched |
 | `total_usd_amount` | REAL | Total USD value of wallet |
 
@@ -155,24 +164,37 @@ Stores USDT transfer records.
 
 | Column | Type | Description |
 |--------|------|-------------|
+| `hash_tx` | TEXT (PK) | Transaction hash |
+| `amount` | TEXT | USDT transfer amount |
+| `status` | INTEGER | Transaction status |
+| `approval_amount` | TEXT | Approval amount |
+| `block_timestamp` | INTEGER | Block timestamp |
+| `block` | INTEGER | Block number |
 | `wallet_from` | TEXT | Sender address |
 | `wallet_to` | TEXT | Receiver address |
 | `wallet_from_id` | INTEGER (FK) | References `accounts.id` |
 | `wallet_to_id` | INTEGER (FK) | References `accounts.id` |
-| `amount` | REAL | USDT transfer amount |
-| `status` | INTEGER | Transaction status |
-| `approval_amount` | REAL | Approval amount |
-| `block_timestamp` | INTEGER | Block timestamp |
-| `block` | INTEGER | Block number |
-| `hash_tx` | TEXT (UNIQUE) | Transaction hash |
 | `confirmed` | INTEGER | Confirmation status |
 | `contract_type` | TEXT | Contract type |
+| `contractType` | INTEGER | Contract type (alternate) |
 | `revert` | INTEGER | Revert flag |
 | `contract_ret` | TEXT | Contract return status |
 | `event_type` | TEXT | Event type |
 | `issue_address` | TEXT | Token issuer address |
 | `decimals` | INTEGER | Token decimals |
+| `exchange_from` | TEXT | Exchange name of sender |
+| `exchange_to` | TEXT | Exchange name of receiver |
+| `is_sent_to_exchange` | INTEGER | Whether sent to exchange |
 | `direction` | INTEGER | Transfer direction |
+| `updated_at` | INTEGER | Last update timestamp (epoch seconds, auto-updated via trigger) |
+
+### `mv_user_wallets_groups_export`
+
+Legacy table for checking previously processed wallets.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `cc_addresses` | TEXT | Wallet address |
 
 ## Project Structure
 
@@ -180,18 +202,26 @@ Stores USDT transfer records.
 tracker_crypto/
 ├── README.md
 ├── Cargo.toml
+├── diesel.toml                 # Diesel CLI configuration
+├── migrations/
+│   └── 2024-01-01-000000_initial_schema/
+│       ├── up.sql              # Schema creation
+│       └── down.sql            # Schema rollback
 ├── src/
-│   ├── main.rs           # Entry point, pipeline orchestration
-│   ├── tracker.rs        # Core tracking logic
-│   ├── db.rs             # Database operations (sqlx)
-│   ├── tronscan.rs       # TronScan API client
-│   ├── arkham.rs         # Arkham Intelligence client
-│   ├── models.rs         # Data structures (serde)
-│   └── config.rs         # Configuration (.env loading)
-├── pull_wallets          # Kill switch: wallet tracking
-├── pull_arkm             # Kill switch: Arkham enrichment
-├── pull_amount           # Kill switch: amount collection
-└── nodejs/               # Reference Node.js implementation
+│   ├── main.rs                 # Entry point, pipeline orchestration
+│   ├── schema.rs               # Auto-generated Diesel schema
+│   ├── models.rs               # Diesel ORM models + API response structs
+│   ├── db.rs                   # Database operations (Diesel)
+│   ├── tracker.rs              # Core tracking logic
+│   ├── tronscan.rs             # TronScan API client
+│   ├── arkham.rs               # Arkham Intelligence client
+│   ├── config.rs               # Configuration (.env loading)
+│   ├── arkham_tests.rs         # Arkham parsing tests
+│   └── db_tests.rs             # Database operation tests
+├── pull_wallets                # Kill switch: wallet tracking
+├── pull_arkm                   # Kill switch: Arkham enrichment
+├── pull_amount                 # Kill switch: amount collection
+└── nodejs/                     # Reference Node.js implementation
 ```
 
 ## Dependencies
@@ -200,7 +230,9 @@ tracker_crypto/
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime |
 | `reqwest` | 0.12.x | HTTP client |
-| `sqlx` | 0.8.x | SQLite database driver (async) |
+| `diesel` | 2.3.x | ORM and query builder |
+| `diesel-async` | 0.7.x | Async Diesel connections |
+| `diesel_migrations` | 2.3.x | Database migration management |
 | `serde` | 1.x | JSON serialization/deserialization |
 | `serde_json` | 1.x | JSON handling |
 | `dotenvy` | 0.15.x | Environment variable loading |
