@@ -60,10 +60,10 @@ pub struct TronScanTransferResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TronScanTransaction {
-    pub amount: Option<f64>,
+    pub amount: Option<String>,
     pub status: Option<i32>,
     #[serde(rename = "approval_amount")]
-    pub approval_amount: Option<f64>,
+    pub approval_amount: Option<String>,
     #[serde(rename = "block_timestamp")]
     pub block_timestamp: Option<i64>,
     pub block: Option<i64>,

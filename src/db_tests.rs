@@ -83,7 +83,7 @@ mod tests {
         db.register_transaction(
             "TSender",
             "TReceiver",
-            Some(100.0),
+            Some("100000000".to_string()),
             Some(-5),
             None,
             None,
@@ -113,7 +113,7 @@ mod tests {
         db.register_transaction(
             "TSender",
             "TReceiver",
-            Some(100.0),
+            Some("100000000".to_string()),
             Some(1),
             None,
             None,

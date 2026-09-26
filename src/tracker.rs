@@ -168,9 +168,9 @@ impl Tracker {
                         .register_transaction(
                             tx.from.as_deref().unwrap_or(""),
                             tx.to.as_deref().unwrap_or(""),
-                            tx.amount,
+                            tx.amount.clone(),
                             tx.status,
-                            tx.approval_amount,
+                            tx.approval_amount.clone(),
                             tx.block_timestamp,
                             tx.block,
                             hash,

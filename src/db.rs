@@ -168,9 +168,9 @@ impl Database {
         &self,
         wallet_from: &str,
         wallet_to: &str,
-        amount: Option<f64>,
+        amount: Option<String>,
         status: Option<i32>,
-        approval_amount: Option<f64>,
+        approval_amount: Option<String>,
         block_timestamp: Option<i64>,
         block: Option<i64>,
         hash_tx: &str,
@@ -192,8 +192,6 @@ impl Database {
         let wallet_from_id = self.get_or_create_account_id(wallet_from, 0).await?;
         let wallet_to_id = self.get_or_create_account_id(wallet_to, 1).await?;
 
-        let amount_str = amount.map(|a| a.to_string());
-        let approval_str = approval_amount.map(|a| a.to_string());
         let ct_alt = contract_type_alt.and_then(|s| s.parse::<i32>().ok());
 
         let mut db = self.db.clone();
@@ -201,9 +199,9 @@ impl Database {
             hash_tx: hash_tx.to_string(),
             wallet_from: Some(wallet_from.to_string()),
             wallet_to: Some(wallet_to.to_string()),
-            amount: amount_str,
+            amount,
             status: Some(status_val),
-            approval_amount: approval_str,
+            approval_amount,
             block_timestamp,
             block,
             wallet_from_id,
