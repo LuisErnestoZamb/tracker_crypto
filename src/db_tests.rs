@@ -1,32 +1,25 @@
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
-    use crate::models::{Account, ProcessedArkhamData};
-    use tempfile::NamedTempFile;
+    use crate::schema::Account;
 
-    async fn setup_db() -> (Database, NamedTempFile) {
-        let tmp = NamedTempFile::new().unwrap();
-        let path = tmp.path().to_str().unwrap();
-        let db = Database::new_with_url(&format!("{}?mode=rwc", path))
-            .await
-            .unwrap();
-        (db, tmp)
+    async fn setup_db() -> Database {
+        Database::new_in_memory().await.unwrap()
     }
 
     #[tokio::test]
     async fn test_get_total_accounts_empty() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
         let total = db.get_total_accounts().await.unwrap();
         assert_eq!(total, 0);
     }
 
     #[tokio::test]
     async fn test_save_and_retrieve_account() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let account = Account {
-            id: 0,
-            wallet: Some("TTestWallet".to_string()),
+            wallet: "TTestWallet".to_string(),
             exchange_name: Some("TestExchange".to_string()),
             is_exchange: Some(1),
             is_contract: Some(0),
@@ -48,11 +41,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_account_upsert() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let account1 = Account {
-            id: 0,
-            wallet: Some("TTestWallet".to_string()),
+            wallet: "TTestWallet".to_string(),
             exchange_name: Some("Exchange1".to_string()),
             is_tracked: Some(1),
             ..Default::default()
@@ -60,8 +52,7 @@ mod tests {
         db.save_account(&account1).await.unwrap();
 
         let account2 = Account {
-            id: 0,
-            wallet: Some("TTestWallet".to_string()),
+            wallet: "TTestWallet".to_string(),
             exchange_name: Some("Exchange2".to_string()),
             is_tracked: Some(1),
             ..Default::default()
@@ -74,7 +65,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_or_create_account_id() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let id1 = db.get_or_create_account_id("TWallet1", 0).await.unwrap();
         let id2 = db.get_or_create_account_id("TWallet2", 1).await.unwrap();
@@ -87,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_and_exist_transaction() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         db.register_transaction(
             "TSender",
@@ -117,7 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_transaction_skips_non_minus5_status() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         db.register_transaction(
             "TSender",
@@ -146,35 +137,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_wallet_on_old_database() {
-        let (db, _tmp) = setup_db().await;
+        let mut db = setup_db().await;
 
         assert!(!db.is_wallet_on_old_database("TUnknown").await.unwrap());
 
-        // Insert directly via Diesel
-        use crate::schema::mv_user_wallets_groups_export;
-        use diesel::prelude::*;
-        use diesel_async::RunQueryDsl;
-
-        let mut conn = db.pool().get().await.unwrap();
-        diesel::insert_into(mv_user_wallets_groups_export::table)
-            .values(mv_user_wallets_groups_export::cc_addresses.eq("TKnownWallet"))
-            .execute(&mut conn)
-            .await
-            .unwrap();
+        // Insert directly via raw SQL
+        toasty::sql::query(
+            "INSERT INTO mv_user_wallets_groups_export (cc_addresses) VALUES (?1)",
+        )
+        .bind("TKnownWallet")
+        .exec(db.db_mut())
+        .await
+        .unwrap();
 
         assert!(db.is_wallet_on_old_database("TKnownWallet").await.unwrap());
     }
 
     #[tokio::test]
     async fn test_get_account_type() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
-        let account_type = db.get_account_type("TUnknown").await.unwrap();
-        assert!(!account_type.exists);
+        let (exists, _, _) = db.get_account_type("TUnknown").await.unwrap();
+        assert!(!exists);
 
         let account = Account {
-            id: 0,
-            wallet: Some("TExchange".to_string()),
+            wallet: "TExchange".to_string(),
             is_exchange: Some(1),
             is_contract: Some(0),
             is_tracked: Some(1),
@@ -182,99 +169,84 @@ mod tests {
         };
         db.save_account(&account).await.unwrap();
 
-        let account_type = db.get_account_type("TExchange").await.unwrap();
-        assert!(account_type.exists);
-        assert!(account_type.is_exchange);
-        assert!(!account_type.is_contract);
+        let (exists, is_ex, is_co) = db.get_account_type("TExchange").await.unwrap();
+        assert!(exists);
+        assert!(is_ex);
+        assert!(!is_co);
     }
 
     #[tokio::test]
     async fn test_accounts_to_check() {
-        let (db, _tmp) = setup_db().await;
+        let mut db = setup_db().await;
 
-        use crate::schema::accounts as acc;
-        use diesel::prelude::*;
-        use diesel_async::RunQueryDsl;
+        // Insert test accounts directly via raw SQL
+        toasty::sql::query(
+            "INSERT INTO accounts (wallet, is_tracked, is_tracked_arkm, is_receiver) VALUES (?1, NULL, ?2, ?3)",
+        )
+        .bind("TW1")
+        .bind(1)
+        .bind(1)
+        .exec(db.db_mut())
+        .await
+        .unwrap();
 
-        let mut conn = db.pool().get().await.unwrap();
+        toasty::sql::query(
+            "INSERT INTO accounts (wallet, is_tracked, is_tracked_arkm, is_receiver) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind("TW2")
+        .bind(1)
+        .bind(1)
+        .bind(1)
+        .exec(db.db_mut())
+        .await
+        .unwrap();
 
-        // TW1: is_tracked=NULL, is_tracked_arkm=1, is_receiver=1 -> should match
-        diesel::insert_into(acc::table)
-            .values((
-                acc::wallet.eq("TW1"),
-                acc::is_tracked.eq::<Option<i32>>(None),
-                acc::is_tracked_arkm.eq(1),
-                acc::is_receiver.eq(1),
-            ))
-            .execute(&mut conn)
-            .await
-            .unwrap();
-
-        // TW2: is_tracked=1, is_tracked_arkm=1, is_receiver=1 -> should NOT match
-        diesel::insert_into(acc::table)
-            .values((
-                acc::wallet.eq("TW2"),
-                acc::is_tracked.eq(1),
-                acc::is_tracked_arkm.eq(1),
-                acc::is_receiver.eq(1),
-            ))
-            .execute(&mut conn)
-            .await
-            .unwrap();
-
-        // TW3: is_tracked=NULL, is_tracked_arkm=NULL, is_receiver=1 -> should NOT match
-        diesel::insert_into(acc::table)
-            .values((
-                acc::wallet.eq("TW3"),
-                acc::is_tracked.eq::<Option<i32>>(None),
-                acc::is_tracked_arkm.eq::<Option<i32>>(None),
-                acc::is_receiver.eq(1),
-            ))
-            .execute(&mut conn)
-            .await
-            .unwrap();
-
-        drop(conn);
+        toasty::sql::query(
+            "INSERT INTO accounts (wallet, is_tracked, is_tracked_arkm, is_receiver) VALUES (?1, NULL, NULL, ?2)",
+        )
+        .bind("TW3")
+        .bind(1)
+        .exec(db.db_mut())
+        .await
+        .unwrap();
 
         let result = db.accounts_to_check(10, 0).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].wallet.as_deref(), Some("TW1"));
+        assert_eq!(result[0].wallet, "TW1");
     }
 
     #[tokio::test]
     async fn test_update_account_intelligence() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let account = Account {
-            id: 0,
-            wallet: Some("TWallet".to_string()),
+            wallet: "TWallet".to_string(),
             is_tracked: Some(1),
             ..Default::default()
         };
         db.save_account(&account).await.unwrap();
 
-        let intel = ProcessedArkhamData {
-            wallet: "TWallet".to_string(),
-            arkham_label: Some("Binance".to_string()),
-            populated_tags: Some(r#"[{"label":"exchange"}]"#.to_string()),
-            is_exchange_arkm: 1,
-            is_contract_arkm: 0,
-            payload_arkm: "{}".to_string(),
-        };
+        db.update_account_intelligence(
+            "TWallet",
+            &Some("Binance".to_string()),
+            &Some(r#"[{"label":"exchange"}]"#.to_string()),
+            1,
+            0,
+            "{}",
+        )
+        .await
+        .unwrap();
 
-        db.update_account_intelligence(&intel).await.unwrap();
-
-        let account_type = db.get_account_type("TWallet").await.unwrap();
-        assert!(account_type.is_exchange);
+        let (_, is_ex, _) = db.get_account_type("TWallet").await.unwrap();
+        assert!(is_ex);
     }
 
     #[tokio::test]
     async fn test_update_amount_account() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let account = Account {
-            id: 0,
-            wallet: Some("TWallet".to_string()),
+            wallet: "TWallet".to_string(),
             is_tracked: Some(1),
             ..Default::default()
         };
@@ -285,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_last_row_timestamp() {
-        let (db, _tmp) = setup_db().await;
+        let db = setup_db().await;
 
         let result = db.last_row_timestamp("TWallet").await.unwrap();
         assert!(result.is_none());

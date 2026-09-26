@@ -1,72 +1,121 @@
-// @generated automatically by Diesel CLI.
+use toasty::Model;
 
-diesel::table! {
-    accounts (id) {
-        id -> Integer,
-        wallet -> Nullable<Text>,
-        exchange_name -> Nullable<Text>,
-        is_exchange -> Nullable<Integer>,
-        is_contract -> Nullable<Integer>,
-        is_tracked -> Nullable<Integer>,
-        #[sql_name = "transferIn"]
-        transfer_in -> Nullable<Integer>,
-        #[sql_name = "transferOut"]
-        transfer_out -> Nullable<Integer>,
-        #[sql_name = "transactionsTron"]
-        transactions_tron -> Nullable<Integer>,
-        #[sql_name = "balanceTron"]
-        balance_tron -> Nullable<Integer>,
-        deep -> Nullable<Integer>,
-        payload_tronscan -> Nullable<Text>,
-        is_exchange_arkm -> Nullable<Integer>,
-        is_contract_arkm -> Nullable<Integer>,
-        is_tracked_arkm -> Nullable<Integer>,
-        payload_arkm -> Nullable<Text>,
-        arkham_label -> Nullable<Text>,
-        populated_tags -> Nullable<Text>,
-        mandatory_scan -> Nullable<Integer>,
-        observations -> Nullable<Text>,
-        is_receiver -> Nullable<Integer>,
-        created_at -> Nullable<Integer>,
-        updated_at -> Nullable<Integer>,
-        is_amount_collected -> Nullable<Integer>,
-        total_usd_amount -> Nullable<Double>,
-    }
+#[derive(Debug, Default, Model)]
+#[table = "accounts"]
+pub struct Account {
+    #[key]
+    #[auto]
+    pub id: i64,
+
+    #[unique]
+    pub wallet: String,
+
+    pub exchange_name: Option<String>,
+
+    pub is_exchange: Option<i32>,
+
+    pub is_contract: Option<i32>,
+
+    pub is_tracked: Option<i32>,
+
+    #[column("transferIn")]
+    pub transfer_in: Option<i64>,
+
+    #[column("transferOut")]
+    pub transfer_out: Option<i64>,
+
+    #[column("transactionsTron")]
+    pub transactions_tron: Option<i64>,
+
+    #[column("balanceTron")]
+    pub balance_tron: Option<i64>,
+
+    pub deep: Option<i32>,
+
+    pub payload_tronscan: Option<String>,
+
+    pub is_exchange_arkm: Option<i32>,
+
+    pub is_contract_arkm: Option<i32>,
+
+    pub is_tracked_arkm: Option<i32>,
+
+    pub payload_arkm: Option<String>,
+
+    pub arkham_label: Option<String>,
+
+    pub populated_tags: Option<String>,
+
+    pub mandatory_scan: Option<i32>,
+
+    pub observations: Option<String>,
+
+    pub is_receiver: Option<i32>,
+
+    pub created_at: Option<i64>,
+
+    pub updated_at: Option<i64>,
+
+    pub is_amount_collected: Option<i32>,
+
+    pub total_usd_amount: Option<f64>,
 }
 
-diesel::table! {
-    mv_user_wallets_groups_export (cc_addresses) {
-        cc_addresses -> Nullable<Text>,
-    }
+#[derive(Debug, Default, Model)]
+#[table = "transactions"]
+pub struct Transaction {
+    #[key]
+    pub hash_tx: String,
+
+    pub amount: Option<String>,
+
+    pub status: Option<i32>,
+
+    pub approval_amount: Option<String>,
+
+    pub block_timestamp: Option<i64>,
+
+    pub block: Option<i64>,
+
+    pub wallet_from: Option<String>,
+
+    pub wallet_to: Option<String>,
+
+    pub wallet_from_id: i64,
+
+    pub wallet_to_id: i64,
+
+    pub confirmed: Option<i32>,
+
+    pub contract_type: Option<String>,
+
+    #[column("contractType")]
+    pub contract_type_alt: Option<i32>,
+
+    pub revert: Option<i32>,
+
+    pub contract_ret: Option<String>,
+
+    pub event_type: Option<String>,
+
+    pub issue_address: Option<String>,
+
+    pub decimals: Option<i32>,
+
+    pub exchange_from: Option<String>,
+
+    pub exchange_to: Option<String>,
+
+    pub is_sent_to_exchange: Option<i32>,
+
+    pub direction: Option<i32>,
+
+    pub updated_at: Option<i64>,
 }
 
-diesel::table! {
-    transactions (hash_tx) {
-        amount -> Nullable<Text>,
-        status -> Nullable<Integer>,
-        approval_amount -> Nullable<Text>,
-        block_timestamp -> Nullable<Integer>,
-        block -> Nullable<Integer>,
-        wallet_from -> Nullable<Text>,
-        wallet_to -> Nullable<Text>,
-        hash_tx -> Text,
-        confirmed -> Nullable<Integer>,
-        contract_type -> Nullable<Text>,
-        #[sql_name = "contractType"]
-        contract_type_alt -> Nullable<Integer>,
-        revert -> Nullable<Integer>,
-        contract_ret -> Nullable<Text>,
-        event_type -> Nullable<Text>,
-        issue_address -> Nullable<Text>,
-        decimals -> Nullable<Integer>,
-        exchange_from -> Nullable<Text>,
-        exchange_to -> Nullable<Text>,
-        is_sent_to_exchange -> Nullable<Integer>,
-        direction -> Nullable<Integer>,
-        updated_at -> Nullable<Integer>,
-        wallet_from_id -> Integer,
-        wallet_to_id -> Integer,
-    }
+#[derive(Debug, Default, Model)]
+#[table = "mv_user_wallets_groups_export"]
+pub struct LegacyWallet {
+    #[key]
+    pub cc_addresses: String,
 }
-
-diesel::allow_tables_to_appear_in_same_query!(accounts, mv_user_wallets_groups_export, transactions,);

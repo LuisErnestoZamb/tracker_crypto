@@ -1,13 +1,13 @@
 # Tracker Crypto — TRON USDT Wallet Tracker (Rust)
 
-A high-performance batch processing pipeline that tracks USDT (TRC-20) transactions on the TRON network. Built with Rust for speed and reliability, it enriches wallet data using TronScan and Arkham Intelligence APIs, filters out exchange wallets, and stores everything in a Turso/libSQL database.
+A high-performance batch processing pipeline that tracks USDT (TRC-20) transactions on the TRON network. Built with Rust for speed and reliability, it enriches wallet data using TronScan and Arkham Intelligence APIs, filters out exchange wallets, and stores everything in a Turso database with cloud sync.
 
 ## Architecture
 
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  TronScan    │────▶│  tracker_crypto  │────▶│   Turso /    │
-│  API         │     │  (Rust binary)   │     │   SQLite DB  │
+│  TronScan    │────▶│  tracker_crypto  │────▶│  Turso Cloud │
+│  API         │     │  (Rust binary)   │     │  (serverless)│
 └──────────────┘     └────────┬─────────┘     └──────────────┘
                               │
                         ┌─────▼──────┐
@@ -26,9 +26,8 @@ A high-performance batch processing pipeline that tracks USDT (TRC-20) transacti
 
 ## Prerequisites
 
-- Rust >= 1.75 ([Install Rust](https://rustup.rs/))
+- Rust >= 1.95 ([Install Rust](https://rustup.rs/))
 - Cargo (included with Rust)
-- [Turso CLI](https://docs.turso.tech/cli) (for local development)
 - API keys:
   - **TronScan** — Get from [TronScan API](https://apilist.tronscanapi.com/)
   - **Arkham Intelligence** — Get from [Arkham](https://platform.arkhamintelligence.com/)
@@ -45,17 +44,14 @@ cargo build --release
 
 # Configure environment variables
 cat << EOF > .env
-TURSO_URL=http://127.0.0.1:8080
-# TURSO_AUTH_TOKEN=
+TURSO_DATABASE_URL=turso://your-db.turso.io
+TURSO_AUTH_TOKEN=your_token
 TRON_TOKEN=your_tronscan_api_key
 ARKM_API_KEY=your_arkham_api_key
 EOF
-
-# Start local Turso database
-turso dev --db-file wallets01.db
 ```
 
-Migrations run automatically on startup via Diesel.
+Schema is managed by Toasty ORM and runs automatically on startup via `push_schema()`.
 
 ## Usage
 
@@ -110,6 +106,15 @@ rm pull_arkm
 rm pull_amount
 ```
 
+### Cloud Sync
+
+Sync local database to Turso Cloud:
+
+```rust
+// Push local writes to cloud
+db.push().await?;
+```
+
 ## External APIs
 
 | API | Endpoint | Rate Limit | Purpose |
@@ -124,11 +129,9 @@ Rate limiting is handled using `tokio::time` or the [`governor`](https://crates.
 
 ## Database Schema
 
-Managed by Diesel migrations. Schema is defined in `migrations/2024-01-01-000000_initial_schema/up.sql`.
+Schema is defined via Toasty ORM models in `src/schema.rs` and created automatically on startup.
 
 ### `accounts`
-
-Stores wallet addresses and their metadata.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -154,13 +157,11 @@ Stores wallet addresses and their metadata.
 | `observations` | TEXT | Notes/observations |
 | `is_receiver` | INTEGER (0/1) | 1 if wallet received funds |
 | `created_at` | INTEGER | Creation timestamp (epoch seconds) |
-| `updated_at` | INTEGER | Last update timestamp (epoch seconds, auto-updated via trigger) |
+| `updated_at` | INTEGER | Last update timestamp (epoch seconds) |
 | `is_amount_collected` | INTEGER (0/1) | Whether USD amount was fetched |
 | `total_usd_amount` | REAL | Total USD value of wallet |
 
 ### `transactions`
-
-Stores USDT transfer records.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -186,7 +187,7 @@ Stores USDT transfer records.
 | `exchange_to` | TEXT | Exchange name of receiver |
 | `is_sent_to_exchange` | INTEGER | Whether sent to exchange |
 | `direction` | INTEGER | Transfer direction |
-| `updated_at` | INTEGER | Last update timestamp (epoch seconds, auto-updated via trigger) |
+| `updated_at` | INTEGER | Last update timestamp (epoch seconds) |
 
 ### `mv_user_wallets_groups_export`
 
@@ -202,16 +203,11 @@ Legacy table for checking previously processed wallets.
 tracker_crypto/
 ├── README.md
 ├── Cargo.toml
-├── diesel.toml                 # Diesel CLI configuration
-├── migrations/
-│   └── 2024-01-01-000000_initial_schema/
-│       ├── up.sql              # Schema creation
-│       └── down.sql            # Schema rollback
 ├── src/
 │   ├── main.rs                 # Entry point, pipeline orchestration
-│   ├── schema.rs               # Auto-generated Diesel schema
-│   ├── models.rs               # Diesel ORM models + API response structs
-│   ├── db.rs                   # Database operations (Diesel)
+│   ├── schema.rs               # Toasty ORM model definitions
+│   ├── db.rs                   # Database operations (Toasty + raw SQL)
+│   ├── models.rs               # API response structs + helpers
 │   ├── tracker.rs              # Core tracking logic
 │   ├── tronscan.rs             # TronScan API client
 │   ├── arkham.rs               # Arkham Intelligence client
@@ -230,9 +226,8 @@ tracker_crypto/
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime |
 | `reqwest` | 0.12.x | HTTP client |
-| `diesel` | 2.3.x | ORM and query builder |
-| `diesel-async` | 0.7.x | Async Diesel connections |
-| `diesel_migrations` | 2.3.x | Database migration management |
+| `toasty` | 0.11.x | Toasty ORM (with Turso driver) |
+| `toasty-driver-turso` | 0.11.x | Turso database driver (serverless + sync) |
 | `serde` | 1.x | JSON serialization/deserialization |
 | `serde_json` | 1.x | JSON handling |
 | `dotenvy` | 0.15.x | Environment variable loading |

@@ -1,7 +1,7 @@
 use crate::arkham::ArkhamClient;
 use crate::config::Config;
 use crate::db::Database;
-use crate::models::Account;
+use crate::schema::Account;
 use crate::tronscan::TronScanClient;
 use anyhow::Result;
 use std::path::Path;
@@ -82,24 +82,24 @@ impl Tracker {
 
         let account = Account {
             id: 0,
-            wallet: Some(self.current_address.clone()),
+            wallet: self.current_address.clone(),
             exchange_name: Some(exchange_name),
             is_exchange: Some(is_exchange),
             is_contract: Some(is_contract),
             is_tracked: Some(1),
-            transfer_in: Some(data.transactions_in.unwrap_or(0) as i32),
-            transfer_out: Some(data.transactions_out.unwrap_or(0) as i32),
+            transfer_in: Some(data.transactions_in.unwrap_or(0)),
+            transfer_out: Some(data.transactions_out.unwrap_or(0)),
             transactions_tron: Some(
                 data.total_transaction_count
                     .or(data.transactions)
-                    .unwrap_or(0) as i32,
+                    .unwrap_or(0),
             ),
             balance_tron: Some(
                 data.balance_str
                     .as_ref()
                     .and_then(|s| s.parse().ok())
                     .or(data.balance.as_ref().and_then(|b| b.as_i64()))
-                    .unwrap_or(0) as i32,
+                    .unwrap_or(0),
             ),
             deep: Some(0),
             payload_tronscan: Some(serde_json::to_string(&data).unwrap_or_default()),
@@ -122,8 +122,8 @@ impl Tracker {
     }
 
     pub async fn is_exchange(&self) -> Result<bool> {
-        let account_type = self.db.get_account_type(&self.current_address).await?;
-        Ok(account_type.is_exchange)
+        let (_, is_ex, _) = self.db.get_account_type(&self.current_address).await?;
+        Ok(is_ex)
     }
 
     pub async fn is_registered_wallet(&self) -> Result<bool> {
@@ -144,7 +144,7 @@ impl Tracker {
                 error!("Error fetching transfers: {}", e);
                 if self.block_timestamp.is_none() {
                     let last_ts = self.db.last_row_timestamp(&self.current_address).await?;
-                    self.block_timestamp = last_ts.map(|v| v as i64);
+                    self.block_timestamp = last_ts;
                     self.pagination = 0;
                     self.should_continue = false;
                 }
@@ -233,7 +233,16 @@ impl Tracker {
             let parsed = ArkhamClient::parse_arkham_data(&payload_arkm);
 
             for data in &parsed {
-                self.db.update_account_intelligence(data).await?;
+                self.db
+                    .update_account_intelligence(
+                        &data.wallet,
+                        &data.arkham_label,
+                        &data.populated_tags,
+                        data.is_exchange_arkm,
+                        data.is_contract_arkm,
+                        &data.payload_arkm,
+                    )
+                    .await?;
             }
 
             info!("Processed {} accounts.", parsed.len());

@@ -1,162 +1,164 @@
 use crate::config::Config;
-use crate::models::{Account, AccountType, NewAccount, NewTransaction, ProcessedArkhamData};
-use crate::schema::{accounts, mv_user_wallets_groups_export, transactions};
+use crate::schema::{Account, LegacyWallet, Transaction};
 use anyhow::{Context, Result};
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
-use diesel_async::pooled_connection::bb8::Pool;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::sync_connection_wrapper::SyncConnectionWrapper;
-use diesel_async::RunQueryDsl;
-use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
-
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
-
-pub type DbConn = SyncConnectionWrapper<SqliteConnection>;
-pub type DbPool = Pool<DbConn>;
-
-type AccountTypeRow = (Option<i32>, Option<i32>, Option<i32>, Option<i32>);
+use toasty_driver_turso::Turso;
 
 #[derive(Clone)]
 pub struct Database {
-    pool: DbPool,
+    db: toasty::Db,
 }
 
 impl Database {
     pub async fn new(config: &Config) -> Result<Self> {
-        let db_url = format!("{}?mode=rwc", config.turso_url);
-        Self::new_with_url(&db_url).await
-    }
-
-    pub async fn new_with_url(db_url: &str) -> Result<Self> {
-        let is_in_memory = db_url.contains(":memory:");
-
-        if is_in_memory {
-            // For in-memory: run migrations on a direct sync connection first,
-            // then use shared cache so pool connections see the same DB.
-            let mut sync_conn = SqliteConnection::establish(db_url)
-                .context("Failed to establish migration connection")?;
-            sync_conn
-                .run_pending_migrations(MIGRATIONS)
-                .map_err(|e| anyhow::anyhow!("Failed to run pending migrations: {}", e))?;
-            drop(sync_conn);
-
-            // Reconnect with shared cache for the pool
-            let shared_url = if db_url.contains('?') {
-                format!("{}&cache=shared", db_url)
-            } else {
-                format!("{}?cache=shared", db_url)
-            };
-            let manager = AsyncDieselConnectionManager::<DbConn>::new(&shared_url);
-            let pool = Pool::builder()
-                .max_size(5)
-                .build(manager)
-                .await
-                .context("Failed to create connection pool")?;
-            Ok(Self { pool })
+        let url = if let Some(ref token) = config.turso_auth_token {
+            format!("{}?authToken={}", config.turso_database_url, token)
         } else {
-            Self::run_migrations_sync(db_url)?;
-            let manager = AsyncDieselConnectionManager::<DbConn>::new(db_url);
-            let pool = Pool::builder()
-                .max_size(5)
-                .build(manager)
-                .await
-                .context("Failed to create connection pool")?;
-            Ok(Self { pool })
-        }
+            config.turso_database_url.clone()
+        };
+
+        let builder =
+            Turso::new(&url).context("Failed to create Turso connection")?;
+
+        let db = toasty::Db::builder()
+            .models(toasty::models![Account, Transaction, LegacyWallet])
+            .build(builder)
+            .await
+            .context("Failed to build Toasty database")?;
+
+        Self::ensure_schema(&db).await?;
+
+        Ok(Self { db })
     }
 
-    fn run_migrations_sync(db_url: &str) -> Result<()> {
-        let mut conn = SqliteConnection::establish(db_url)
-            .context("Failed to establish migration connection")?;
-        conn.run_pending_migrations(MIGRATIONS)
-            .map_err(|e| anyhow::anyhow!("Failed to run pending migrations: {}", e))?;
+    pub async fn new_local(db_path: &str) -> Result<Self> {
+        let builder = Turso::file(db_path);
+
+        let db = toasty::Db::builder()
+            .models(toasty::models![Account, Transaction, LegacyWallet])
+            .build(builder)
+            .await
+            .context("Failed to build local Toasty database")?;
+
+        Self::ensure_schema(&db).await?;
+
+        Ok(Self { db })
+    }
+
+    pub async fn new_in_memory() -> Result<Self> {
+        let driver = Turso::in_memory();
+
+        let db = toasty::Db::builder()
+            .models(toasty::models![Account, Transaction, LegacyWallet])
+            .build(driver)
+            .await
+            .context("Failed to build in-memory Toasty database")?;
+
+        Self::ensure_schema(&db).await?;
+
+        Ok(Self { db })
+    }
+
+    async fn ensure_schema(db: &toasty::Db) -> Result<()> {
+        let mut conn = db.connection().await?;
+
+        let rows = toasty::sql::query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'",
+        )
+        .exec(&mut conn)
+        .await
+        .context("Failed to check for existing tables")?;
+
+        if rows.is_empty() {
+            db.push_schema().await.context("Failed to push schema")?;
+        }
+
+        Ok(())
+    }
+
+    pub fn db(&self) -> &toasty::Db {
+        &self.db
+    }
+
+    pub fn db_mut(&mut self) -> &mut toasty::Db {
+        &mut self.db
+    }
+
+    pub async fn push(&self) -> Result<()> {
+        self.db.push_schema().await.context("Failed to push schema")?;
         Ok(())
     }
 
     pub async fn get_total_accounts(&self) -> Result<i64> {
-        let mut conn = self.pool.get().await?;
-        let count: i64 = accounts::table.count().get_result(&mut conn).await?;
-        Ok(count)
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM accounts")
+            .exec(&mut db)
+            .await
+            .context("Failed to count accounts")?;
+
+        if let Some(toasty::stmt::Value::Record(cols)) = rows.first() {
+            if let Some(toasty::stmt::Value::I64(count)) = cols.first() {
+                return Ok(*count);
+            }
+        }
+
+        Ok(0)
     }
 
     pub async fn save_account(&self, data: &Account) -> Result<()> {
-        let mut conn = self.pool.get().await?;
-
-        let new_account = NewAccount {
-            wallet: data.wallet.clone().unwrap_or_default(),
-            exchange_name: data.exchange_name.clone(),
-            is_exchange: data.is_exchange,
-            is_contract: data.is_contract,
-            is_tracked: data.is_tracked,
-            transfer_in: data.transfer_in,
-            transfer_out: data.transfer_out,
-            transactions_tron: data.transactions_tron,
-            balance_tron: data.balance_tron,
-            deep: data.deep,
-            payload_tronscan: data.payload_tronscan.clone(),
-        };
-
-        diesel::insert_into(accounts::table)
-            .values(&new_account)
-            .on_conflict(accounts::wallet)
-            .do_update()
-            .set((
-                accounts::exchange_name.eq(&new_account.exchange_name),
-                accounts::is_exchange.eq(new_account.is_exchange),
-                accounts::is_contract.eq(new_account.is_contract),
-                accounts::is_tracked.eq(new_account.is_tracked),
-                accounts::transfer_in.eq(new_account.transfer_in),
-                accounts::transfer_out.eq(new_account.transfer_out),
-                accounts::transactions_tron.eq(new_account.transactions_tron),
-                accounts::balance_tron.eq(new_account.balance_tron),
-                accounts::payload_tronscan.eq(&new_account.payload_tronscan),
-            ))
-            .execute(&mut conn)
+        let mut db = self.db.clone();
+        Account::upsert_by_wallet(&data.wallet)
+            .on_create(|acct| {
+                acct.exchange_name(data.exchange_name.clone())
+                    .is_exchange(data.is_exchange)
+                    .is_contract(data.is_contract)
+                    .is_tracked(data.is_tracked)
+                    .transfer_in(data.transfer_in)
+                    .transfer_out(data.transfer_out)
+                    .transactions_tron(data.transactions_tron)
+                    .balance_tron(data.balance_tron)
+                    .deep(data.deep)
+                    .payload_tronscan(data.payload_tronscan.clone())
+            })
+            .on_update(|acct| {
+                acct.exchange_name(data.exchange_name.clone())
+                    .is_exchange(data.is_exchange)
+                    .is_contract(data.is_contract)
+                    .is_tracked(data.is_tracked)
+                    .transfer_in(data.transfer_in)
+                    .transfer_out(data.transfer_out)
+                    .transactions_tron(data.transactions_tron)
+                    .balance_tron(data.balance_tron)
+                    .payload_tronscan(data.payload_tronscan.clone())
+            })
+            .exec(&mut db)
             .await
             .context("Failed to save account")?;
         Ok(())
     }
 
-    pub async fn get_or_create_account_id(&self, wallet: &str, _is_receiver: i32) -> Result<i32> {
-        let mut conn = self.pool.get().await?;
+    pub async fn get_or_create_account_id(&self, wallet: &str, _is_receiver: i32) -> Result<i64> {
+        let mut db = self.db.clone();
 
-        let existing: Option<i32> = accounts::table
-            .filter(accounts::wallet.eq(wallet))
-            .select(accounts::id)
-            .first(&mut conn)
-            .await
-            .optional()?;
-
-        if let Some(id) = existing {
-            return Ok(id);
+        if let Some(existing) = Account::filter_by_wallet(wallet)
+            .select(Account::fields().id())
+            .first()
+            .exec(&mut db)
+            .await?
+        {
+            return Ok(existing);
         }
 
-        let new_account = NewAccount {
-            wallet: wallet.to_string(),
-            exchange_name: None,
-            is_exchange: None,
-            is_contract: None,
-            is_tracked: None,
-            transfer_in: None,
-            transfer_out: None,
-            transactions_tron: None,
-            balance_tron: None,
-            deep: None,
-            payload_tronscan: None,
-        };
-
-        diesel::insert_into(accounts::table)
-            .values(&new_account)
-            .execute(&mut conn)
+        toasty::create!(Account { wallet: wallet.to_string() })
+            .exec(&mut db)
             .await
             .context("Failed to create account")?;
 
-        let id: i32 = accounts::table
-            .filter(accounts::wallet.eq(wallet))
-            .select(accounts::id)
-            .first(&mut conn)
-            .await?;
+        let id = Account::filter_by_wallet(wallet)
+            .select(Account::fields().id())
+            .first()
+            .exec(&mut db)
+            .await?
+            .context("Failed to get new account ID")?;
 
         Ok(id)
     }
@@ -187,147 +189,195 @@ impl Database {
             return Ok(());
         }
 
-        let mut conn = self.pool.get().await?;
-
         let wallet_from_id = self.get_or_create_account_id(wallet_from, 0).await?;
         let wallet_to_id = self.get_or_create_account_id(wallet_to, 1).await?;
 
-        let new_tx = NewTransaction {
-            amount: amount.map(|a| a.to_string()),
-            status: Some(status_val),
-            approval_amount: approval_amount.map(|a| a.to_string()),
-            block_timestamp: block_timestamp.map(|v| v as i32),
-            block: block.map(|v| v as i32),
+        let amount_str = amount.map(|a| a.to_string());
+        let approval_str = approval_amount.map(|a| a.to_string());
+        let ct_alt = contract_type_alt.and_then(|s| s.parse::<i32>().ok());
+
+        let mut db = self.db.clone();
+        toasty::create!(Transaction {
+            hash_tx: hash_tx.to_string(),
             wallet_from: Some(wallet_from.to_string()),
             wallet_to: Some(wallet_to.to_string()),
-            hash_tx: hash_tx.to_string(),
+            amount: amount_str,
+            status: Some(status_val),
+            approval_amount: approval_str,
+            block_timestamp,
+            block,
+            wallet_from_id,
+            wallet_to_id,
             confirmed,
             contract_type: contract_type.map(|s| s.to_string()),
-            contract_type_alt: contract_type_alt.and_then(|s| s.parse().ok()),
+            contract_type_alt: ct_alt,
             revert,
             contract_ret: contract_ret.map(|s| s.to_string()),
             event_type: event_type.map(|s| s.to_string()),
             issue_address: issue_address.map(|s| s.to_string()),
             decimals,
+            direction,
             exchange_from: Some(String::new()),
             exchange_to: Some(String::new()),
             is_sent_to_exchange: Some(0),
-            direction,
-            wallet_from_id,
-            wallet_to_id,
-        };
+        })
+        .exec(&mut db)
+        .await
+        .context("Failed to register transaction")?;
 
-        diesel::insert_into(transactions::table)
-            .values(&new_tx)
-            .execute(&mut conn)
-            .await
-            .context("Failed to register transaction")?;
         Ok(())
     }
 
     pub async fn exist_transaction(&self, hash: &str) -> Result<bool> {
-        let mut conn = self.pool.get().await?;
-        let count: i64 = transactions::table
-            .filter(transactions::hash_tx.eq(hash))
-            .count()
-            .get_result(&mut conn)
-            .await?;
-        Ok(count > 0)
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query("SELECT COUNT(*) FROM transactions WHERE hash_tx = ?1")
+            .bind(hash)
+            .exec(&mut db)
+            .await
+            .context("Failed to check transaction")?;
+
+        if let Some(toasty::stmt::Value::Record(cols)) = rows.first() {
+            if let Some(toasty::stmt::Value::I64(count)) = cols.first() {
+                return Ok(*count > 0);
+            }
+        }
+
+        Ok(false)
     }
 
-    pub async fn last_row_timestamp(&self, wallet_address: &str) -> Result<Option<i32>> {
-        let mut conn = self.pool.get().await?;
+    pub async fn last_row_timestamp(&self, wallet_address: &str) -> Result<Option<i64>> {
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query(
+            "SELECT t.block_timestamp
+             FROM transactions t
+             JOIN accounts a_from ON a_from.id = t.wallet_from_id
+             JOIN accounts a_to   ON a_to.id   = t.wallet_to_id
+             WHERE a_to.wallet = ?1 OR a_from.wallet = ?1
+             ORDER BY t.block_timestamp DESC
+             LIMIT 1",
+        )
+        .bind(wallet_address)
+        .exec(&mut db)
+        .await
+        .context("Failed to get last timestamp")?;
 
-        let result: Option<Option<i32>> = transactions::table
-            .filter(
-                transactions::wallet_from
-                    .eq(wallet_address)
-                    .or(transactions::wallet_to.eq(wallet_address)),
-            )
-            .select(transactions::block_timestamp)
-            .order_by(transactions::block_timestamp.desc())
-            .first(&mut conn)
-            .await
-            .optional()?;
+        if let Some(toasty::stmt::Value::Record(cols)) = rows.first() {
+            if let Some(toasty::stmt::Value::I64(ts)) = cols.first() {
+                return Ok(Some(*ts));
+            }
+        }
 
-        Ok(result.flatten())
+        Ok(None)
     }
 
     pub async fn is_wallet_on_old_database(&self, wallet_address: &str) -> Result<bool> {
-        let mut conn = self.pool.get().await?;
+        let mut db = self.db.clone();
+        let result = LegacyWallet::filter_by_cc_addresses(wallet_address)
+            .first()
+            .exec(&mut db)
+            .await
+            .context("Failed to check old database")?;
 
-        let exists: bool = diesel::select(diesel::dsl::exists(
-            mv_user_wallets_groups_export::table
-                .filter(mv_user_wallets_groups_export::cc_addresses.eq(wallet_address)),
-        ))
-        .get_result(&mut conn)
-        .await?;
-
-        Ok(exists)
+        Ok(result.is_some())
     }
 
-    pub async fn get_account_type(&self, wallet: &str) -> Result<AccountType> {
-        let mut conn = self.pool.get().await?;
+    pub async fn get_account_type(
+        &self,
+        wallet: &str,
+    ) -> Result<(bool, bool, bool)> {
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query(
+            "SELECT is_exchange, is_contract, is_exchange_arkm, is_contract_arkm
+             FROM accounts WHERE wallet = ?1 LIMIT 1",
+        )
+        .bind(wallet)
+        .exec(&mut db)
+        .await
+        .context("Failed to get account type")?;
 
-        let result: Option<AccountTypeRow> = accounts::table
-            .filter(accounts::wallet.eq(wallet))
-            .select((
-                accounts::is_exchange,
-                accounts::is_contract,
-                accounts::is_exchange_arkm,
-                accounts::is_contract_arkm,
-            ))
-            .first(&mut conn)
-            .await
-            .optional()?;
+        if let Some(toasty::stmt::Value::Record(cols)) = rows.first() {
+            let is_exchange = cols.first().and_then(|v| match v {
+                toasty::stmt::Value::I64(x) => Some(*x as i32),
+                toasty::stmt::Value::I32(x) => Some(*x),
+                _ => None,
+            });
+            let is_contract = cols.get(1).and_then(|v| match v {
+                toasty::stmt::Value::I64(x) => Some(*x as i32),
+                toasty::stmt::Value::I32(x) => Some(*x),
+                _ => None,
+            });
+            let is_exchange_arkm = cols.get(2).and_then(|v| match v {
+                toasty::stmt::Value::I64(x) => Some(*x as i32),
+                toasty::stmt::Value::I32(x) => Some(*x),
+                _ => None,
+            });
+            let is_contract_arkm = cols.get(3).and_then(|v| match v {
+                toasty::stmt::Value::I64(x) => Some(*x as i32),
+                toasty::stmt::Value::I32(x) => Some(*x),
+                _ => None,
+            });
 
-        match result {
-            Some((is_exchange, is_contract, is_exchange_arkm, is_contract_arkm)) => {
-                let is_ex = is_exchange.unwrap_or(0) == 1 || is_exchange_arkm.unwrap_or(0) == 1;
-                let is_co = is_contract.unwrap_or(0) == 1 || is_contract_arkm.unwrap_or(0) == 1;
-                Ok(AccountType {
-                    exists: true,
-                    is_exchange: is_ex,
-                    is_contract: is_co,
-                })
-            }
-            None => Ok(AccountType::default()),
+            let is_ex = is_exchange.unwrap_or(0) == 1 || is_exchange_arkm.unwrap_or(0) == 1;
+            let is_co = is_contract.unwrap_or(0) == 1 || is_contract_arkm.unwrap_or(0) == 1;
+
+            return Ok((true, is_ex, is_co));
         }
+
+        Ok((false, false, false))
     }
 
     pub async fn accounts_to_check(&self, limit: i64, offset: i64) -> Result<Vec<Account>> {
-        let mut conn = self.pool.get().await?;
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query(
+            "SELECT id, wallet, exchange_name, is_exchange, is_contract, is_tracked,
+                    transferIn, transferOut, transactionsTron, balanceTron, deep,
+                    payload_tronscan, is_exchange_arkm, is_contract_arkm, is_tracked_arkm,
+                    payload_arkm, arkham_label, populated_tags, mandatory_scan,
+                    observations, is_receiver, created_at, updated_at,
+                    is_amount_collected, total_usd_amount
+             FROM accounts
+             WHERE is_tracked IS NULL AND is_tracked_arkm = 1 AND is_receiver = 1
+             ORDER BY id ASC
+             LIMIT ?1 OFFSET ?2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .exec(&mut db)
+        .await
+        .context("Failed to query accounts to check")?;
 
-        let results: Vec<Account> = accounts::table
-            .filter(accounts::is_tracked.is_null())
-            .filter(accounts::is_tracked_arkm.eq(1))
-            .filter(accounts::is_receiver.eq(1))
-            .order_by(accounts::id.asc())
-            .limit(limit)
-            .offset(offset)
-            .select(Account::as_select())
-            .load(&mut conn)
-            .await?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            if let toasty::stmt::Value::Record(cols) = row {
+                accounts.push(parse_account_from_cols(&cols)?);
+            }
+        }
 
-        Ok(results)
+        Ok(accounts)
     }
 
     pub async fn accounts_to_check_for_arkm(&self) -> Result<Vec<String>> {
-        let mut conn = self.pool.get().await?;
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query(
+            "SELECT wallet FROM accounts
+             WHERE is_tracked_arkm IS NULL OR is_tracked_arkm = 0
+             ORDER BY id ASC
+             LIMIT 1000",
+        )
+        .exec(&mut db)
+        .await
+        .context("Failed to query accounts for arkm")?;
 
-        let results: Vec<Option<String>> = accounts::table
-            .filter(
-                accounts::is_tracked_arkm
-                    .is_null()
-                    .or(accounts::is_tracked_arkm.eq(0)),
-            )
-            .order_by(accounts::id.asc())
-            .limit(1000)
-            .select(accounts::wallet)
-            .load(&mut conn)
-            .await?;
+        let mut wallets = Vec::new();
+        for row in rows {
+            if let toasty::stmt::Value::Record(cols) = row {
+                if let Some(toasty::stmt::Value::String(w)) = cols.first() {
+                    wallets.push(w.clone());
+                }
+            }
+        }
 
-        Ok(results.into_iter().flatten().collect())
+        Ok(wallets)
     }
 
     pub async fn accounts_to_check_without_amount(
@@ -335,53 +385,135 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Account>> {
-        let mut conn = self.pool.get().await?;
+        let mut db = self.db.clone();
+        let rows = toasty::sql::query(
+            "SELECT id, wallet, exchange_name, is_exchange, is_contract, is_tracked,
+                    transferIn, transferOut, transactionsTron, balanceTron, deep,
+                    payload_tronscan, is_exchange_arkm, is_contract_arkm, is_tracked_arkm,
+                    payload_arkm, arkham_label, populated_tags, mandatory_scan,
+                    observations, is_receiver, created_at, updated_at,
+                    is_amount_collected, total_usd_amount
+             FROM accounts
+             WHERE is_amount_collected = 0
+             ORDER BY id ASC
+             LIMIT ?1 OFFSET ?2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .exec(&mut db)
+        .await
+        .context("Failed to query accounts without amount")?;
 
-        let results: Vec<Account> = accounts::table
-            .filter(accounts::is_amount_collected.eq(0))
-            .order_by(accounts::id.asc())
-            .limit(limit)
-            .offset(offset)
-            .select(Account::as_select())
-            .load(&mut conn)
-            .await?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            if let toasty::stmt::Value::Record(cols) = row {
+                accounts.push(parse_account_from_cols(&cols)?);
+            }
+        }
 
-        Ok(results)
+        Ok(accounts)
     }
 
-    pub async fn update_account_intelligence(&self, data: &ProcessedArkhamData) -> Result<()> {
-        let mut conn = self.pool.get().await?;
-
-        diesel::update(accounts::table.filter(accounts::wallet.eq(&data.wallet)))
-            .set((
-                accounts::is_tracked_arkm.eq(1),
-                accounts::arkham_label.eq(&data.arkham_label),
-                accounts::populated_tags.eq(&data.populated_tags),
-                accounts::is_exchange_arkm.eq(data.is_exchange_arkm),
-                accounts::is_contract_arkm.eq(data.is_contract_arkm),
-                accounts::payload_arkm.eq(&data.payload_arkm),
-            ))
-            .execute(&mut conn)
+    pub async fn update_account_intelligence(
+        &self,
+        wallet: &str,
+        arkham_label: &Option<String>,
+        populated_tags: &Option<String>,
+        is_exchange_arkm: i32,
+        is_contract_arkm: i32,
+        payload_arkm: &str,
+    ) -> Result<()> {
+        let mut db = self.db.clone();
+        Account::filter_by_wallet(wallet)
+            .update()
+            .is_tracked_arkm(Some(1))
+            .arkham_label(arkham_label.clone())
+            .populated_tags(populated_tags.clone())
+            .is_exchange_arkm(Some(is_exchange_arkm))
+            .is_contract_arkm(Some(is_contract_arkm))
+            .payload_arkm(Some(payload_arkm.to_string()))
+            .exec(&mut db)
             .await
             .context("Failed to update account intelligence")?;
         Ok(())
     }
 
     pub async fn update_amount_account(&self, wallet: &str, amount: f64) -> Result<()> {
-        let mut conn = self.pool.get().await?;
-
-        diesel::update(accounts::table.filter(accounts::wallet.eq(wallet)))
-            .set((
-                accounts::is_amount_collected.eq(1),
-                accounts::total_usd_amount.eq(amount),
-            ))
-            .execute(&mut conn)
+        let mut db = self.db.clone();
+        Account::filter_by_wallet(wallet)
+            .update()
+            .is_amount_collected(Some(1))
+            .total_usd_amount(Some(amount))
+            .exec(&mut db)
             .await
             .context("Failed to update amount account")?;
         Ok(())
     }
+}
 
-    pub fn pool(&self) -> &DbPool {
-        &self.pool
-    }
+fn parse_account_from_cols(cols: &[toasty::stmt::Value]) -> Result<Account> {
+    let get_i64 = |idx: usize| -> Option<i64> {
+        cols.get(idx).and_then(|v| match v {
+            toasty::stmt::Value::I64(x) => Some(*x),
+            toasty::stmt::Value::I32(x) => Some(*x as i64),
+            toasty::stmt::Value::Null => None,
+            _ => None,
+        })
+    };
+
+    let get_i32 = |idx: usize| -> Option<i32> {
+        cols.get(idx).and_then(|v| match v {
+            toasty::stmt::Value::I64(x) => Some(*x as i32),
+            toasty::stmt::Value::I32(x) => Some(*x),
+            toasty::stmt::Value::Null => None,
+            _ => None,
+        })
+    };
+
+    let get_text = |idx: usize| -> Option<String> {
+        cols.get(idx).and_then(|v| match v {
+            toasty::stmt::Value::String(x) => Some(x.clone()),
+            toasty::stmt::Value::Null => None,
+            _ => None,
+        })
+    };
+
+    let get_f64 = |idx: usize| -> Option<f64> {
+        cols.get(idx).and_then(|v| match v {
+            toasty::stmt::Value::F64(x) => Some(*x),
+            toasty::stmt::Value::F32(x) => Some(*x as f64),
+            toasty::stmt::Value::I64(x) => Some(*x as f64),
+            toasty::stmt::Value::I32(x) => Some(*x as f64),
+            toasty::stmt::Value::Null => None,
+            _ => None,
+        })
+    };
+
+    Ok(Account {
+        id: get_i64(0).unwrap_or(0),
+        wallet: get_text(1).unwrap_or_default(),
+        exchange_name: get_text(2),
+        is_exchange: get_i32(3),
+        is_contract: get_i32(4),
+        is_tracked: get_i32(5),
+        transfer_in: get_i64(6),
+        transfer_out: get_i64(7),
+        transactions_tron: get_i64(8),
+        balance_tron: get_i64(9),
+        deep: get_i32(10),
+        payload_tronscan: get_text(11),
+        is_exchange_arkm: get_i32(12),
+        is_contract_arkm: get_i32(13),
+        is_tracked_arkm: get_i32(14),
+        payload_arkm: get_text(15),
+        arkham_label: get_text(16),
+        populated_tags: get_text(17),
+        mandatory_scan: get_i32(18),
+        observations: get_text(19),
+        is_receiver: get_i32(20),
+        created_at: get_i64(21),
+        updated_at: get_i64(22),
+        is_amount_collected: get_i32(23),
+        total_usd_amount: get_f64(24),
+    })
 }
